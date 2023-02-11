@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"flag"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -16,8 +18,54 @@ type structResult struct {
 }
 
 type interfaceResult struct {
-	name  string
-	iface *ast.InterfaceType
+	name    string
+	methods []interfaceMethod
+}
+
+func (ir *interfaceResult) String() string {
+	var buffer bytes.Buffer
+
+	for i, method := range ir.methods {
+		buffer.WriteString("  " + method.String())
+		if i != len(ir.methods)-1 {
+			buffer.WriteString("\n")
+		}
+	}
+
+	return fmt.Sprintf(`%s {
+%s
+}`, ir.name, &buffer)
+}
+
+type interfaceMethod struct {
+	name        string
+	inputTypes  []string
+	outputTypes []string
+}
+
+func (im *interfaceMethod) String() string {
+	var buffer bytes.Buffer
+
+	buffer.WriteString(im.name)
+
+	buffer.WriteString("(")
+	for i, input := range im.inputTypes {
+		buffer.WriteString(input)
+		if i != len(im.inputTypes)-1 {
+			buffer.WriteString(", ")
+		}
+	}
+	buffer.WriteString(")")
+
+	buffer.WriteString("(")
+	for i, output := range im.outputTypes {
+		buffer.WriteString(output)
+		if i != len(im.outputTypes)-1 {
+			buffer.WriteString(", ")
+		}
+	}
+	buffer.WriteString(")")
+	return buffer.String()
 }
 
 type parseError struct {
@@ -25,26 +73,40 @@ type parseError struct {
 	err  error
 }
 
+const Usage = `Usage: interface-inspector -code <path> -interface <interface name>
+`
+
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Println("Usage: go run main.go <directory>")
+	codeDirectory := flag.String("code", ".", "the directory that contains the code")
+	interfaceName := flag.String("interface", "", "the name of the interface")
+
+	flag.Parse()
+	flag.Usage = func() {
+		fmt.Printf("%s", Usage)
+	}
+
+	if *interfaceName == "" {
+		flag.Usage()
 		os.Exit(1)
 	}
-	dir := os.Args[1]
 
 	var (
-		interfaces    = make([]interfaceResult, 0)
-		interfacesMap = make(map[string]bool)
-		structs       = make([]structResult, 0)
-		structsMap    = make(map[string]bool)
-		parseErrors   = make(chan parseError)
-		ifacesCh      = make(chan interfaceResult)
-		structCh      = make(chan structResult)
+		interfaces = make([]interfaceResult, 0)
+
+		structs    = make([]structResult, 0)
+		structsMap = make(map[string]bool)
 	)
 
-	// log errors
+	var (
+		parseErrorsCh = make(chan parseError)
+		ifacesCh      = make(chan interfaceResult)
+		structCh      = make(chan structResult)
+		readIfacesCh  = make(chan struct{})
+	)
+
+	// log parse errors
 	go func() {
-		for parseError := range parseErrors {
+		for parseError := range parseErrorsCh {
 			fmt.Printf("error parsing %s: %v\n", parseError.path, parseError.err)
 		}
 	}()
@@ -52,11 +114,9 @@ func main() {
 	// aggregate interfaces
 	go func() {
 		for iface := range ifacesCh {
-			if _, ok := interfacesMap[iface.name]; !ok {
-				interfaces = append(interfaces, iface)
-				interfacesMap[iface.name] = true
-			}
+			interfaces = append(interfaces, iface)
 		}
+		readIfacesCh <- struct{}{}
 	}()
 
 	// aggregate structs
@@ -70,18 +130,21 @@ func main() {
 	}()
 
 	// walk and emit paths
-	var wg sync.WaitGroup
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+	var writeWg sync.WaitGroup
+	err := filepath.Walk(*codeDirectory, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if info.IsDir() || filepath.Ext(path) != ".go" {
 			return nil
 		}
-		wg.Add(1)
+		writeWg.Add(1)
 		go func() {
-			defer wg.Done()
-			parseFile(path, parseErrors, ifacesCh, structCh)
+			defer writeWg.Done()
+			err := parseFile(path, ifacesCh, structCh, *interfaceName)
+			if err != nil {
+				parseErrorsCh <- parseError{err: err, path: path}
+			}
 		}()
 		return nil
 	})
@@ -91,34 +154,47 @@ func main() {
 		os.Exit(1)
 	}
 
-	wg.Wait()
+	writeWg.Wait()
+	// close ifacesCh so the routine reading the interfaces can finish
+	close(ifacesCh)
+	close(structCh)
+	// wait for the routine reading the interfaces to finish
+	<-readIfacesCh
 
-	fmt.Printf("Interfaces\n")
-	for _, iface := range interfaces {
-		fmt.Println(iface.name)
+	if len(interfaces) == 0 {
+		fmt.Printf("No interface found with name %s\n", *interfaceName)
+		os.Exit(1)
 	}
-	fmt.Printf("Structs\n")
+
+	fmt.Printf("Interfaces:\n")
+	for _, iface := range interfaces {
+		fmt.Println(iface.String())
+	}
+
+	fmt.Printf("Structs:\n")
 	for _, strct := range structs {
 		fmt.Println(strct.name)
 	}
 }
 
-func parseFile(path string, parseErrors chan<- parseError, interfaces chan interfaceResult, structs chan structResult) {
+func parseFile(path string, interfaces chan<- interfaceResult, structs chan<- structResult, interfaceName string) error {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, path, nil, parser.AllErrors)
 	if err != nil {
-		parseErrors <- parseError{path: path, err: err}
+		return err
 	}
 
 	ast.Inspect(f, func(node ast.Node) bool {
 		if typeSpec, ok := node.(*ast.TypeSpec); ok {
 			name := typeSpec.Name.Name
+			// we have in interface
 			theInterface, ok := typeSpec.Type.(*ast.InterfaceType)
-			if ok {
-				interfaces <- interfaceResult{name: name, iface: theInterface}
+			if ok && interfaceName == name {
+				interfaces <- interfaceResult{name: name, methods: extractMethods(theInterface)}
 				return true
 			}
 
+			// we have a struct
 			theStruct, ok := typeSpec.Type.(*ast.StructType)
 			if ok {
 				structs <- structResult{name: name, strct: theStruct}
@@ -128,41 +204,31 @@ func parseFile(path string, parseErrors chan<- parseError, interfaces chan inter
 		return true
 	})
 
+	return nil
 }
 
-func implements(iface *ast.InterfaceType, strct *ast.StructType) bool {
-	for _, field := range strct.Fields.List {
-		if field.Names == nil {
-			// The field is an anonymous field, so check if it implements the interface
-			fieldType, ok := field.Type.(*ast.StructType)
-			if !ok {
-				// The field is not an *ast.Ident, so continue to the next field
-				continue
-			}
+func extractMethods(iface *ast.InterfaceType) []interfaceMethod {
+	methods := []interfaceMethod{}
 
-			if implements(iface, fieldType) {
-				// The anonymous field implements the interface, so the struct implements the interface
-				return true
-			}
+	for _, field := range iface.Methods.List {
+		method := interfaceMethod{}
+		for _, name := range field.Names {
+			method.name = name.Name
+			typ := field.Type.(*ast.FuncType)
+			method.inputTypes = getFieldTypes(typ.Params)
+			method.outputTypes = getFieldTypes(typ.Results)
+			methods = append(methods, method)
 		}
 	}
+	return methods
+}
 
-	for _, method := range iface.Methods.List {
-		found := false
-		for _, strctField := range strct.Fields.List {
-			if strctField.Names[0].Name == method.Names[0].Name &&
-				strctField.Type == method.Type {
-				found = true
-				break
-			}
-		}
-
-		if !found {
-			// The struct does not implement all the methods of the interface, so it does not implement the interface
-			return false
+func getFieldTypes(results *ast.FieldList) []string {
+	outputTypes := []string{}
+	if results != nil {
+		for _, result := range results.List {
+			outputTypes = append(outputTypes, result.Type.(*ast.Ident).Name)
 		}
 	}
-
-	// The struct implements all the methods of the interface, so it implements the interface
-	return true
+	return outputTypes
 }
