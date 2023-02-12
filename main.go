@@ -4,8 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
-	"go/importer"
-	"go/parser"
 	"go/token"
 	"go/types"
 	"os"
@@ -28,7 +26,7 @@ type strctFound struct {
 }
 
 func (s *strctFound) String() string {
-	return fmt.Sprintf("%s %s %s:%d:%d", s.name, s.strct.String(), s.position.Filename, s.position.Line, s.position.Column)
+	return fmt.Sprintf("%s %s:%d:%d", s.name, s.position.Filename, s.position.Line, s.position.Column)
 }
 
 const Usage = `Usage: interface-inspector [OPTIONS]
@@ -63,42 +61,38 @@ func main() {
 
 	pkgs, err := packages.Load(&packages.Config{Mode: packages.LoadAllSyntax}, "./...")
 	if err != nil {
+		fmt.Printf("error: load packages: %v\n", err)
 		os.Exit(1)
 	}
 
 	// search for the interface in the package
 	iface, err := findInterface(pkgs, *packageName, *packageDirectory, *interfaceName)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Printf("error: find interfaces: %v\n", err)
 		os.Exit(1)
 	}
 
 	// find structs
-	strcts, err := findStrcts(pkgs)
-	if err != nil {
-		fmt.Printf("error while finding structs: %v\n", err)
+	strcts := findStrcts(pkgs)
+	strctsImplementingIface := getStrctsImplementingIface(*packageDirectory, strcts, iface)
+	if len(strctsImplementingIface) == 0 {
+		fmt.Printf("error: no structs implement the interface %q defined in package %q\n", *interfaceName, *packageName)
 		os.Exit(1)
 	}
 
-	theStrcts := getStrctsImplementingIface(*packageDirectory, strcts, iface)
-	if len(theStrcts) == 0 {
-		fmt.Printf("no structs implement the interface %q defined in package %q\n", *interfaceName, *packageName)
-		os.Exit(1)
-	}
-
-	for _, strct := range theStrcts {
+	for _, strct := range strctsImplementingIface {
 		fmt.Printf("%s\n", strct.String())
 	}
 }
 
 // findInterface finds an interface with the name interfaceName in package packageName
 func findInterface(pkgs []*packages.Package, packageName, packageDirectory, interfaceName string) (findInterfaceResult, error) {
-
 	var astf []*ast.File
 	pkgFound := false
 	var thePackage *packages.Package
+	var isRootDir = packageDirectory == "." || packageDirectory == "./"
 	for _, pkg := range pkgs {
-		if pkg.Name == packageName && strings.Contains(pkg.PkgPath, packageDirectory) {
+		if pkg.Name == packageName && (strings.Contains(pkg.PkgPath, packageDirectory) || isRootDir) {
 			pkgFound = true
 			thePackage = pkg
 			for _, f := range pkg.Syntax {
@@ -109,19 +103,19 @@ func findInterface(pkgs []*packages.Package, packageName, packageDirectory, inte
 	}
 
 	if !pkgFound {
-		return findInterfaceResult{}, fmt.Errorf("couldn't find a package named %s in %s", packageName, packageDirectory)
+		return findInterfaceResult{}, fmt.Errorf("couldn't find a package named %q in %q", packageName, packageDirectory)
 	}
 
 	scope := thePackage.Types.Scope()
 
 	interfaceType := scope.Lookup(interfaceName)
 	if interfaceType == nil {
-		return findInterfaceResult{}, fmt.Errorf("no such interface %s in package %s", interfaceName, packageName)
+		return findInterfaceResult{}, fmt.Errorf("no such interface %q in package %q", interfaceName, packageName)
 	}
 
 	theInterface, ok := interfaceType.Type().Underlying().(*types.Interface)
 	if !ok {
-		return findInterfaceResult{}, fmt.Errorf("no such interface %s in package %s", interfaceName, packageName)
+		return findInterfaceResult{}, fmt.Errorf("no such interface %q in package %q", interfaceName, packageName)
 	}
 
 	return findInterfaceResult{pkg: *thePackage.Types, iface: theInterface, ifaceName: interfaceName}, nil
@@ -140,66 +134,14 @@ func getStrctsImplementingIface(path string, strcts []strctFound, iface findInte
 	return strctResult
 }
 
-// findStructsInDir finds all structs in directory dir.
-func findStructsInDir(dir string) ([]*strctFound, error) {
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, dir, nil, parser.AllErrors)
-	if err != nil {
-		return []*strctFound{}, nil
-	}
-
-	var astf []*ast.File
-	for _, pkg := range pkgs {
-		for _, f := range pkg.Files {
-			astf = append(astf, f)
-		}
-	}
-
-	config := &types.Config{
-		Error: func(e error) {
-			fmt.Println(e)
-		},
-		Importer: importer.Default(),
-	}
-
-	info := types.Info{
-		Types: make(map[ast.Expr]types.TypeAndValue),
-		Defs:  make(map[*ast.Ident]types.Object),
-		Uses:  make(map[*ast.Ident]types.Object),
-	}
-
-	pkg, err := config.Check(dir, fset, astf, &info)
-	if err != nil {
-		return []*strctFound{}, fmt.Errorf("error config.Check: %v", err)
-	}
-
-	scope := pkg.Scope()
-	strcts := make([]*strctFound, 0)
-	for _, name := range scope.Names() {
-		obj := scope.Lookup(name)
-		theStruct, ok := obj.Type().Underlying().(*types.Struct)
-
-		if ok {
-			strcts = append(strcts, &strctFound{
-				obj:      obj,
-				strct:    *theStruct,
-				name:     obj.Name(),
-				position: fset.Position(obj.Pos())})
-		}
-	}
-	return strcts, nil
-}
-
-// findStrcts finds all structs in the project under the path.
-// it emits the found structs to structsCh and any error to errorsCh.
-func findStrcts(pkgs []*packages.Package) ([]strctFound, error) {
+// findStrcts finds all structs in the project.
+func findStrcts(pkgs []*packages.Package) []strctFound {
 	strcts := make([]strctFound, 0)
 	for _, pkg := range pkgs {
 		scope := pkg.Types.Scope()
 		for _, name := range scope.Names() {
 			obj := scope.Lookup(name)
 			theStruct, ok := obj.Type().Underlying().(*types.Struct)
-
 			if ok {
 				strcts = append(strcts, strctFound{
 					obj:      obj,
@@ -211,5 +153,5 @@ func findStrcts(pkgs []*packages.Package) ([]strctFound, error) {
 
 	}
 
-	return strcts, nil
+	return strcts
 }
