@@ -1,234 +1,215 @@
 package main
 
 import (
-	"bytes"
 	"flag"
 	"fmt"
 	"go/ast"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
-	"path/filepath"
-	"sync"
+	"strings"
+
+	"golang.org/x/tools/go/packages"
 )
 
-type structResult struct {
-	name  string
-	strct *ast.StructType
+type findInterfaceResult struct {
+	pkg       types.Package
+	iface     *types.Interface
+	ifaceName string
 }
 
-type interfaceResult struct {
-	name    string
-	methods []interfaceMethod
+type strctFound struct {
+	obj      types.Object
+	strct    types.Struct
+	name     string
+	position token.Position
 }
 
-func (ir *interfaceResult) String() string {
-	var buffer bytes.Buffer
-
-	for i, method := range ir.methods {
-		buffer.WriteString("  " + method.String())
-		if i != len(ir.methods)-1 {
-			buffer.WriteString("\n")
-		}
-	}
-
-	return fmt.Sprintf(`%s {
-%s
-}`, ir.name, &buffer)
+func (s *strctFound) String() string {
+	return fmt.Sprintf("%s %s %s:%d:%d", s.name, s.strct.String(), s.position.Filename, s.position.Line, s.position.Column)
 }
 
-type interfaceMethod struct {
-	name        string
-	inputTypes  []string
-	outputTypes []string
-}
+const Usage = `Usage: interface-inspector [OPTIONS]
 
-func (im *interfaceMethod) String() string {
-	var buffer bytes.Buffer
+Options:
+ package_dir	The directory that contains the package where the interface is defined
+ package	The name of the package that the interface belongs to
+ interface	The name of the interface
 
-	buffer.WriteString(im.name)
-
-	buffer.WriteString("(")
-	for i, input := range im.inputTypes {
-		buffer.WriteString(input)
-		if i != len(im.inputTypes)-1 {
-			buffer.WriteString(", ")
-		}
-	}
-	buffer.WriteString(")")
-
-	buffer.WriteString("(")
-	for i, output := range im.outputTypes {
-		buffer.WriteString(output)
-		if i != len(im.outputTypes)-1 {
-			buffer.WriteString(", ")
-		}
-	}
-	buffer.WriteString(")")
-	return buffer.String()
-}
-
-type parseError struct {
-	path string
-	err  error
-}
-
-const Usage = `Usage: interface-inspector -code <path> -interface <interface name>
-`
+Example:
+ interface-inspector \
+   -package_dir pkg/cmd \ 
+   -package cmd \
+   -interface Stringer		This will show all structs implementing the interface "Stringer".
+				The interface "Stringer" belongs to package "cmd" whose files are in "pkg/cmd"
+				The structs to be examined are all under path "pkg"`
 
 func main() {
-	codeDirectory := flag.String("code", ".", "the directory that contains the code")
+	packageDirectory := flag.String("package_dir", ".", "path of the package containing the interface")
+	packageName := flag.String("package", "", "the package name")
 	interfaceName := flag.String("interface", "", "the name of the interface")
 
-	flag.Parse()
 	flag.Usage = func() {
-		fmt.Printf("%s", Usage)
+		fmt.Println(Usage)
 	}
+	flag.Parse()
 
-	if *interfaceName == "" {
+	if *interfaceName == "" || *packageName == "" {
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	var (
-		interfaces = make([]interfaceResult, 0)
+	pkgs, err := packages.Load(&packages.Config{Mode: packages.LoadAllSyntax}, "./...")
+	if err != nil {
+		os.Exit(1)
+	}
 
-		structs    = make([]structResult, 0)
-		structsMap = make(map[string]bool)
-	)
-
-	var (
-		parseErrorsCh = make(chan parseError)
-		ifacesCh      = make(chan interfaceResult)
-		structCh      = make(chan structResult)
-		readIfacesCh  = make(chan struct{})
-	)
-
-	// log parse errors
-	go func() {
-		for parseError := range parseErrorsCh {
-			fmt.Printf("error parsing %s: %v\n", parseError.path, parseError.err)
-		}
-	}()
-
-	// aggregate interfaces
-	go func() {
-		for iface := range ifacesCh {
-			interfaces = append(interfaces, iface)
-		}
-		readIfacesCh <- struct{}{}
-	}()
-
-	// aggregate structs
-	go func() {
-		for strct := range structCh {
-			if _, ok := structsMap[strct.name]; !ok {
-				structs = append(structs, strct)
-				structsMap[strct.name] = true
-			}
-		}
-	}()
-
-	// walk and emit paths
-	var writeWg sync.WaitGroup
-	err := filepath.Walk(*codeDirectory, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() || filepath.Ext(path) != ".go" {
-			return nil
-		}
-		writeWg.Add(1)
-		go func() {
-			defer writeWg.Done()
-			err := parseFile(path, ifacesCh, structCh, *interfaceName)
-			if err != nil {
-				parseErrorsCh <- parseError{err: err, path: path}
-			}
-		}()
-		return nil
-	})
-
+	// search for the interface in the package
+	iface, err := findInterface(pkgs, *packageName, *packageDirectory, *interfaceName)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
 
-	writeWg.Wait()
-	// close ifacesCh so the routine reading the interfaces can finish
-	close(ifacesCh)
-	close(structCh)
-	// wait for the routine reading the interfaces to finish
-	<-readIfacesCh
-
-	if len(interfaces) == 0 {
-		fmt.Printf("No interface found with name %s\n", *interfaceName)
+	// find structs
+	strcts, err := findStrcts(pkgs)
+	if err != nil {
+		fmt.Printf("error while finding structs: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Interfaces:\n")
-	for _, iface := range interfaces {
-		fmt.Println(iface.String())
+	theStrcts := getStrctsImplementingIface(*packageDirectory, strcts, iface)
+	if len(theStrcts) == 0 {
+		fmt.Printf("no structs implement the interface %q defined in package %q\n", *interfaceName, *packageName)
+		os.Exit(1)
 	}
 
-	fmt.Printf("Structs:\n")
-	for _, strct := range structs {
-		fmt.Println(strct.name)
+	for _, strct := range theStrcts {
+		fmt.Printf("%s\n", strct.String())
 	}
 }
 
-func parseFile(path string, interfaces chan<- interfaceResult, structs chan<- structResult, interfaceName string) error {
+// findInterface finds an interface with the name interfaceName in package packageName
+func findInterface(pkgs []*packages.Package, packageName, packageDirectory, interfaceName string) (findInterfaceResult, error) {
+
+	var astf []*ast.File
+	pkgFound := false
+	var thePackage *packages.Package
+	for _, pkg := range pkgs {
+		if pkg.Name == packageName && strings.Contains(pkg.PkgPath, packageDirectory) {
+			pkgFound = true
+			thePackage = pkg
+			for _, f := range pkg.Syntax {
+				astf = append(astf, f)
+			}
+			break
+		}
+	}
+
+	if !pkgFound {
+		return findInterfaceResult{}, fmt.Errorf("couldn't find a package named %s in %s", packageName, packageDirectory)
+	}
+
+	scope := thePackage.Types.Scope()
+
+	interfaceType := scope.Lookup(interfaceName)
+	if interfaceType == nil {
+		return findInterfaceResult{}, fmt.Errorf("no such interface %s in package %s", interfaceName, packageName)
+	}
+
+	theInterface, ok := interfaceType.Type().Underlying().(*types.Interface)
+	if !ok {
+		return findInterfaceResult{}, fmt.Errorf("no such interface %s in package %s", interfaceName, packageName)
+	}
+
+	return findInterfaceResult{pkg: *thePackage.Types, iface: theInterface, ifaceName: interfaceName}, nil
+}
+
+// getStrctsImplementingIface returns all structs from strcts that implement the interface iface
+func getStrctsImplementingIface(path string, strcts []strctFound, iface findInterfaceResult) []strctFound {
+	strctResult := make([]strctFound, 0)
+	for _, strct := range strcts {
+		ptr := types.NewPointer(strct.obj.Type())
+		if types.Implements(ptr, iface.iface) {
+			strctResult = append(strctResult, strct)
+		}
+	}
+
+	return strctResult
+}
+
+// findStructsInDir finds all structs in directory dir.
+func findStructsInDir(dir string) ([]*strctFound, error) {
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, path, nil, parser.AllErrors)
+	pkgs, err := parser.ParseDir(fset, dir, nil, parser.AllErrors)
 	if err != nil {
-		return err
+		return []*strctFound{}, nil
 	}
 
-	ast.Inspect(f, func(node ast.Node) bool {
-		if typeSpec, ok := node.(*ast.TypeSpec); ok {
-			name := typeSpec.Name.Name
-			// we have in interface
-			theInterface, ok := typeSpec.Type.(*ast.InterfaceType)
-			if ok && interfaceName == name {
-				interfaces <- interfaceResult{name: name, methods: extractMethods(theInterface)}
-				return true
-			}
+	var astf []*ast.File
+	for _, pkg := range pkgs {
+		for _, f := range pkg.Files {
+			astf = append(astf, f)
+		}
+	}
 
-			// we have a struct
-			theStruct, ok := typeSpec.Type.(*ast.StructType)
+	config := &types.Config{
+		Error: func(e error) {
+			fmt.Println(e)
+		},
+		Importer: importer.Default(),
+	}
+
+	info := types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue),
+		Defs:  make(map[*ast.Ident]types.Object),
+		Uses:  make(map[*ast.Ident]types.Object),
+	}
+
+	pkg, err := config.Check(dir, fset, astf, &info)
+	if err != nil {
+		return []*strctFound{}, fmt.Errorf("error config.Check: %v", err)
+	}
+
+	scope := pkg.Scope()
+	strcts := make([]*strctFound, 0)
+	for _, name := range scope.Names() {
+		obj := scope.Lookup(name)
+		theStruct, ok := obj.Type().Underlying().(*types.Struct)
+
+		if ok {
+			strcts = append(strcts, &strctFound{
+				obj:      obj,
+				strct:    *theStruct,
+				name:     obj.Name(),
+				position: fset.Position(obj.Pos())})
+		}
+	}
+	return strcts, nil
+}
+
+// findStrcts finds all structs in the project under the path.
+// it emits the found structs to structsCh and any error to errorsCh.
+func findStrcts(pkgs []*packages.Package) ([]strctFound, error) {
+	strcts := make([]strctFound, 0)
+	for _, pkg := range pkgs {
+		scope := pkg.Types.Scope()
+		for _, name := range scope.Names() {
+			obj := scope.Lookup(name)
+			theStruct, ok := obj.Type().Underlying().(*types.Struct)
+
 			if ok {
-				structs <- structResult{name: name, strct: theStruct}
-				return true
+				strcts = append(strcts, strctFound{
+					obj:      obj,
+					strct:    *theStruct,
+					name:     obj.Name(),
+					position: pkg.Fset.Position(obj.Pos())})
 			}
 		}
-		return true
-	})
 
-	return nil
-}
-
-func extractMethods(iface *ast.InterfaceType) []interfaceMethod {
-	methods := []interfaceMethod{}
-
-	for _, field := range iface.Methods.List {
-		method := interfaceMethod{}
-		for _, name := range field.Names {
-			method.name = name.Name
-			typ := field.Type.(*ast.FuncType)
-			method.inputTypes = getFieldTypes(typ.Params)
-			method.outputTypes = getFieldTypes(typ.Results)
-			methods = append(methods, method)
-		}
 	}
-	return methods
-}
 
-func getFieldTypes(results *ast.FieldList) []string {
-	outputTypes := []string{}
-	if results != nil {
-		for _, result := range results.List {
-			outputTypes = append(outputTypes, result.Type.(*ast.Ident).Name)
-		}
-	}
-	return outputTypes
+	return strcts, nil
 }

@@ -11,7 +11,7 @@ type walker struct {
 	url string
 }
 
-func (w walker) Walk() error {
+func (w *walker) Walk() error {
 	fmt.Printf("waling %s\n", w.url)
 	return nil
 }
