@@ -11,7 +11,7 @@ See which `structs` implement a given `interface`.
   awsFetcher /home/tester/Documents/projects/interface-inspector/pkg/aws/aws.go:3:6
   facebookFetcher /home/tester/Documents/projects/interface-inspector/pkg/facebook/facebook.go:3:6
   ```
-- Clicking with the mouse on the path in the output in an editor like `VS Code` would open the strcut directly which is handy in big projects where a lot of structs implement an interface and one wants to see all of them.
+- Clicking with the mouse on the path in the output in an editor like `VSCode` would open the strcut directly which is handy in big projects where a lot of structs implement an interface and one wants to see all of them.
 
   ```
   ├── go.mod
@@ -59,3 +59,7 @@ See which `structs` implement a given `interface`.
 #### Usage:
 
 - Run `interface-inspector -h`
+
+#### TODOS:
+
+- Write a VSCode extension to interface with this. the extension should return the output in something like a quickpick list similar to what vscode does with the output of the language server.
