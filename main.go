@@ -37,12 +37,9 @@ Options:
  interface	The name of the interface
 
 Example:
- interface-inspector \
-   -package_dir pkg/cmd \ 
-   -package cmd \
-   -interface Stringer		This will show all structs implementing the interface "Stringer".
-				The interface "Stringer" belongs to package "cmd" whose files are in "pkg/cmd"
-				The structs to be examined are all under path "pkg"`
+ interface-inspector -package_dir pkg/cmd -package cmd -interface Stringer	This will show all structs implementing the interface "Stringer".
+										The interface "Stringer" belongs to package "cmd" whose files are in "pkg/cmd"
+										The structs to be examined are all under path "pkg"`
 
 func main() {
 	packageDirectory := flag.String("package_dir", ".", "path of the package containing the interface")
